@@ -1,0 +1,138 @@
+brain-tumor-segmentation/
+│
+├── README.md
+├── requirements.txt
+├── environment.yml
+├── .gitignore
+├── LICENSE
+│
+├── configs/
+│   ├── brisc/
+│   │   ├── unet_resnet34.yaml
+│   │   ├── deeplabv3plus_resnet50.yaml
+│   │   ├── segformer_b0.yaml
+│   │   └── hybrid_model.yaml
+│   │
+│   └── brats/
+│       ├── unet_resnet34.yaml
+│       ├── deeplabv3plus_resnet50.yaml
+│       ├── segresnet.yaml
+│       ├── segformer_b0.yaml
+│       └── hybrid_model.yaml
+│
+├── data/
+│   ├── raw/
+│   │   ├── brisc/
+│   │   └── brats/
+│   │
+│   ├── processed/
+│   │   ├── brisc/
+│   │   │   ├── images/
+│   │   │   │   ├── train/
+│   │   │   │   ├── val/
+│   │   │   │   └── test/
+│   │   │   └── masks/
+│   │   │       ├── train/
+│   │   │       ├── val/
+│   │   │       └── test/
+│   │   │
+│   │   └── brats/
+│   │       ├── images/
+│   │       ├── masks/
+│   │       └── metadata/
+│   │
+│   └── splits/
+│       ├── brisc_train.csv
+│       ├── brisc_val.csv
+│       ├── brisc_test.csv
+│       ├── brats_train.csv
+│       ├── brats_val.csv
+│       └── brats_test.csv
+│
+├── notebooks/
+│   ├── 01_brisc_eda.ipynb
+│   ├── 02_brats_eda.ipynb
+│   ├── 03_visualize_samples.ipynb
+│   └── 04_results_analysis.ipynb
+│
+├── src/
+│   ├── datasets/
+│   │   ├── brisc_dataset.py
+│   │   ├── brats_dataset.py
+│   │   └── transforms.py
+│   │
+│   ├── models/
+│   │   ├── unet.py
+│   │   ├── deeplabv3plus.py
+│   │   ├── segformer.py
+│   │   ├── segresnet.py
+│   │   └── hybrid_model.py
+│   │
+│   ├── losses/
+│   │   ├── dice_loss.py
+│   │   ├── focal_loss.py
+│   │   ├── tversky_loss.py
+│   │   └── combined_loss.py
+│   │
+│   ├── metrics/
+│   │   ├── dice.py
+│   │   ├── iou.py
+│   │   ├── precision_recall.py
+│   │   ├── hd95.py
+│   │   └── asd.py
+│   │
+│   ├── training/
+│   │   ├── trainer.py
+│   │   ├── validate.py
+│   │   └── early_stopping.py
+│   │
+│   ├── evaluation/
+│   │   ├── evaluate_model.py
+│   │   ├── compare_models.py
+│   │   └── save_predictions.py
+│   │
+│   └── utils/
+│       ├── seed.py
+│       ├── logger.py
+│       ├── visualization.py
+│       └── config.py
+│
+├── scripts/
+│   ├── prepare_brisc.py
+│   ├── prepare_brats.py
+│   ├── run_eda_brisc.py
+│   ├── run_eda_brats.py
+│   ├── train.py
+│   ├── evaluate.py
+│   └── predict.py
+│
+├── experiments/
+│   ├── brisc/
+│   │   ├── unet_resnet34/
+│   │   ├── deeplabv3plus/
+│   │   ├── segformer/
+│   │   └── hybrid_model/
+│   │
+│   └── brats/
+│       ├── unet_resnet34/
+│       ├── deeplabv3plus/
+│       ├── segresnet/
+│       ├── segformer/
+│       └── hybrid_model/
+│
+├── results/
+│   ├── tables/
+│   ├── figures/
+│   ├── predictions/
+│   └── final_comparison.csv
+│
+├── docs/
+│   ├── dataset_description.md
+│   ├── methodology.md
+│   ├── experiment_plan.md
+│   └── paper_notes.md
+│
+└── tests/
+    ├── test_dataset_loading.py
+    ├── test_metrics.py
+    └── test_mask_values.py

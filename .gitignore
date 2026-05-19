@@ -1,0 +1,16 @@
+data/raw/
+data/processed/
+experiments/
+runs/
+outputs/
+predicted_masks/
+results/
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.nii
+*.nii.gz
+__pycache__/
+venv/
+.env
