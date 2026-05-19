@@ -1,16 +1,39 @@
+# Raw and processed datasets
 data/raw/
 data/processed/
+
+# Experiment outputs and checkpoints
 experiments/
 runs/
 outputs/
 predicted_masks/
-results/
+
+# Large model files
 *.pt
 *.pth
 *.ckpt
+
+# Compressed files
 *.zip
+
+# Medical imaging files
 *.nii
 *.nii.gz
+
+# Python cache
 __pycache__/
+*.pyc
+
+# Virtual environments
 venv/
+.venv/
+
+# Environment variables
 .env
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Allow final results structure
+results/predictions/
+results/checkpoints/
