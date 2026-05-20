@@ -1,0 +1,2 @@
+total_images,ok_images,images_with_tumour_pixels,empty_masks,mean_tumour_ratio,median_tumour_ratio,max_tumour_ratio,min_tumour_ratio
+3933,3933,3933,0,0.018347186836718824,0.01438140869140625,0.1960936740841512,0.0004119873046875

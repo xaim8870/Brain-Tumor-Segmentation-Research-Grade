@@ -1,0 +1,9 @@
+split,tumor_label,count
+test,glioma,762
+test,meningioma,918
+test,no_tumor,140
+test,pituitary,900
+train,glioma,3441
+train,meningioma,3987
+train,no_tumor,1067
+train,pituitary,4371

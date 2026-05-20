@@ -1,0 +1,7 @@
+split,plane_label,count
+test,axial,1090
+test,coronal,819
+test,sagittal,811
+train,axial,4081
+train,coronal,4408
+train,sagittal,4377

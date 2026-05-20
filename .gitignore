@@ -37,3 +37,6 @@ venv/
 # Allow final results structure
 results/predictions/
 results/checkpoints/
+
+*summary.txt
+summary.txt

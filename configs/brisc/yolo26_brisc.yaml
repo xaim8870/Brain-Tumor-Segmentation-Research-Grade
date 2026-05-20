@@ -1,0 +1,52 @@
+# configs/brisc/yolo26_brisc.yaml
+
+project:
+  task_name: "BRISC YOLOv26 Multi-Class Tumour Segmentation"
+  seed: 42
+
+paths:
+  # Change this path according to your own machine.
+  # This should be the folder that contains segmentation_task / segmentation_mask.
+  brisc_root: "D:/Brain Tumor Segmentation/data/raw/BRICS/brisc2025"
+
+  # Processed YOLO dataset output
+  yolo_dataset_root: "data/processed/brisc_yolo_seg"
+
+  # Split CSV output folder
+  splits_dir: "data/splits"
+
+  # YOLO dataset yaml created after preparation
+  yolo_yaml: "data/processed/brisc_yolo_seg/brisc_yolo_seg.yaml"
+
+  # Validation CSV created after preparation
+  val_csv: "data/splits/brisc_yolo_val.csv"
+
+  # YOLOv26 model weights
+  model_weights: "yolo26n-seg.pt"
+
+  # Experiment output
+  experiment_project: "experiments/brisc_yolo26"
+  experiment_name: "yolo26n_multiclass_seg_100epochs"
+
+prepare:
+  val_ratio: 0.2
+  threshold: 128
+  min_area: 20.0
+  epsilon_ratio: 0.002
+
+train:
+  epochs: 100
+  imgsz: 256
+  batch: 4
+  device: "0"
+  workers: 4
+  optimizer: "auto"
+
+eval:
+  conf: 0.25
+  iou: 0.7
+  eval_batch: 4
+  mask_threshold: 128
+  eval_img_limit: 0
+  save_per_sample: false
+  delete_epoch_weights_after_eval: false
