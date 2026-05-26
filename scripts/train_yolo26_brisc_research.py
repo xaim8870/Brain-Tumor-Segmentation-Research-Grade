@@ -1,30 +1,84 @@
+# scripts/train_yolo26_brisc_research.py
+
 from pathlib import Path
 import argparse
 import re
 import os
 import gc
+import sys
 
 import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from scipy.ndimage import distance_transform_edt, binary_erosion
 
 from ultralytics import YOLO
 
 
-EPS = 1e-7
+# -------------------------------------------------------
+# Repo imports
+# -------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT))
+
+from src.metrics.segmentation_metrics import (
+    STANDARD_BINARY_METRIC_COLUMNS,
+    compute_binary_segmentation_metrics,
+)
 
 
-# -----------------------------
+# -------------------------------------------------------
 # Basic utilities
-# -----------------------------
+# -------------------------------------------------------
 
 def read_mask_binary(mask_path: Path, threshold: int = 128):
-    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    """
+    Reads a ground-truth mask and converts it into a 2D binary mask.
+
+    Handles:
+    - H x W grayscale masks
+    - H x W x 1 masks
+    - H x W x 3 BGR masks
+    - H x W x 4 BGRA masks
+
+    Output:
+    - H x W boolean mask
+    """
+
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
 
     if mask is None:
         raise FileNotFoundError(f"Could not read mask: {mask_path}")
+
+    if mask.ndim == 2:
+        pass
+
+    elif mask.ndim == 3:
+        channels = mask.shape[2]
+
+        if channels == 1:
+            mask = mask[:, :, 0]
+
+        elif channels == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+
+        elif channels == 4:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGRA2GRAY)
+
+        else:
+            raise ValueError(
+                f"Unsupported mask channel count: {channels}, "
+                f"shape={mask.shape}, path={mask_path}"
+            )
+
+    else:
+        raise ValueError(f"Unsupported mask shape: {mask.shape}, path={mask_path}")
+
+    if mask.ndim != 2:
+        raise ValueError(
+            f"Mask should be 2D after processing, got {mask.shape}: {mask_path}"
+        )
 
     return mask >= threshold
 
@@ -41,10 +95,31 @@ def get_eval_image_path(row):
             if path.exists():
                 return path
 
-    raise FileNotFoundError("No valid image path found in validation CSV row.")
+    raise FileNotFoundError(
+        "No valid image path found. Expected output_image_path or image_path."
+    )
+
+
+def get_mask_path(row):
+    if "mask_path" not in row or pd.isna(row["mask_path"]):
+        raise FileNotFoundError("mask_path column missing or empty.")
+
+    mask_path = Path(str(row["mask_path"]))
+
+    if not mask_path.exists():
+        raise FileNotFoundError(f"Mask path does not exist: {mask_path}")
+
+    return mask_path
 
 
 def extract_epoch_number(weight_path: Path):
+    """
+    Extracts epoch number from:
+    epoch1.pt
+    epoch25.pt
+    epoch100.pt
+    """
+
     match = re.search(r"epoch(\d+)", weight_path.stem.lower())
 
     if match:
@@ -53,35 +128,153 @@ def extract_epoch_number(weight_path: Path):
     return None
 
 
-def find_epoch_weights(run_dir: Path):
+def get_weight_name_and_epoch(weight_path: Path):
+    epoch = extract_epoch_number(weight_path)
+
+    if epoch is not None:
+        return f"epoch_{epoch:03d}", epoch
+
+    stem = weight_path.stem.lower()
+
+    if stem == "best":
+        return "best", -1
+
+    if stem == "last":
+        return "last", -2
+
+    return weight_path.stem, -999
+
+
+def collect_weights(run_dir: Path, mode: str = "epochs"):
+    """
+    mode:
+    - epochs: only epoch*.pt
+    - best: only best.pt
+    - last: only last.pt
+    - best-last: best.pt and last.pt
+    - all: epoch*.pt if available, otherwise best.pt and last.pt
+    """
+
     weights_dir = run_dir / "weights"
 
     if not weights_dir.exists():
         raise FileNotFoundError(f"Weights folder not found: {weights_dir}")
 
-    epoch_weights = list(weights_dir.glob("epoch*.pt"))
+    best = weights_dir / "best.pt"
+    last = weights_dir / "last.pt"
 
-    epoch_weights = [
-        p for p in epoch_weights
-        if extract_epoch_number(p) is not None
+    epoch_weights = sorted(
+        [
+            p for p in weights_dir.glob("epoch*.pt")
+            if extract_epoch_number(p) is not None
+        ],
+        key=lambda p: extract_epoch_number(p),
+    )
+
+    selected = []
+
+    if mode == "epochs":
+        selected = epoch_weights
+
+    elif mode == "best":
+        if best.exists():
+            selected = [best]
+
+    elif mode == "last":
+        if last.exists():
+            selected = [last]
+
+    elif mode == "best-last":
+        if best.exists():
+            selected.append(best)
+        if last.exists():
+            selected.append(last)
+
+    elif mode == "all":
+        if epoch_weights:
+            selected = epoch_weights
+        else:
+            if best.exists():
+                selected.append(best)
+            if last.exists():
+                selected.append(last)
+
+    if not selected:
+        available = [p.name for p in weights_dir.glob("*.pt")]
+        raise RuntimeError(
+            f"No weights found for mode={mode}. "
+            f"Available files in {weights_dir}: {available}"
+        )
+
+    return selected
+
+
+def validate_split_csv(df: pd.DataFrame, csv_path: Path):
+    required_cols = ["mask_path", "class_id"]
+
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"{csv_path} missing required column: {col}")
+
+    if "output_image_path" not in df.columns and "image_path" not in df.columns:
+        raise ValueError(
+            f"{csv_path} must contain either output_image_path or image_path column."
+        )
+
+
+def find_actual_run_dir(project: str, name: str) -> Path:
+    """
+    Finds where Ultralytics actually saved the run.
+
+    It may save in:
+    - experiments/brisc_yolo26/run_name
+    - REPO_ROOT/experiments/brisc_yolo26/run_name
+    - REPO_ROOT/runs/segment/experiments/brisc_yolo26/run_name
+    - runs/segment/experiments/brisc_yolo26/run_name
+    """
+
+    project_path = Path(project)
+
+    candidates = [
+        project_path / name,
+        REPO_ROOT / project_path / name,
+        REPO_ROOT / "runs" / "segment" / project_path / name,
+        Path("runs") / "segment" / project_path / name,
     ]
 
-    epoch_weights = sorted(epoch_weights, key=lambda p: extract_epoch_number(p))
+    for candidate in candidates:
+        if candidate.exists() and (candidate / "weights").exists():
+            return candidate
 
-    return epoch_weights
+    print("\n[DEBUG] Checked these possible run directories:")
+    for candidate in candidates:
+        print(candidate)
+
+    raise FileNotFoundError(
+        "Could not find YOLO run directory with weights folder. "
+        "Check where Ultralytics saved the training run."
+    )
 
 
-# -----------------------------
-# Prediction mask conversion
-# -----------------------------
+# -------------------------------------------------------
+# YOLO prediction conversion
+# -------------------------------------------------------
 
 def result_to_binary_mask(result, target_shape):
     """
-    Converts YOLO segmentation prediction into a binary mask.
-    All predicted tumour masks are combined into one binary prediction mask.
+    Converts YOLO segmentation polygons into a 2D binary mask.
+
+    For medical segmentation metrics, predicted polygons must be converted
+    into pixel masks before comparing with the ground-truth mask.
     """
 
-    height, width = target_shape
+    if len(target_shape) == 2:
+        height, width = target_shape
+    elif len(target_shape) == 3:
+        height, width = target_shape[:2]
+    else:
+        raise ValueError(f"Invalid target shape: {target_shape}")
+
     pred_mask = np.zeros((height, width), dtype=np.uint8)
 
     if result.masks is None:
@@ -109,7 +302,7 @@ def result_to_binary_mask(result, target_shape):
 
 def get_top_predicted_class(result):
     """
-    Returns top-confidence predicted class.
+    Returns the class with highest confidence.
     If no detection exists, returns -1.
     """
 
@@ -126,133 +319,26 @@ def get_top_predicted_class(result):
     confs = result.boxes.conf.detach().cpu().numpy()
 
     top_index = int(np.argmax(confs))
+
     return int(classes[top_index])
 
 
-# -----------------------------
-# Medical segmentation metrics
-# -----------------------------
+def get_num_predictions(result):
+    if result.boxes is None or result.boxes.cls is None:
+        return 0
 
-def compute_overlap_metrics(pred, gt):
-    pred = pred.astype(bool)
-    gt = gt.astype(bool)
-
-    tp = np.logical_and(pred, gt).sum()
-    fp = np.logical_and(pred, np.logical_not(gt)).sum()
-    fn = np.logical_and(np.logical_not(pred), gt).sum()
-    tn = np.logical_and(np.logical_not(pred), np.logical_not(gt)).sum()
-
-    dice = (2.0 * tp) / (2.0 * tp + fp + fn + EPS)
-    iou = tp / (tp + fp + fn + EPS)
-
-    precision = tp / (tp + fp + EPS)
-    recall = tp / (tp + fn + EPS)
-    specificity = tn / (tn + fp + EPS)
-
-    pred_volume = pred.sum()
-    gt_volume = gt.sum()
-
-    volume_similarity = 1.0 - (
-        abs(float(pred_volume) - float(gt_volume)) /
-        (float(pred_volume) + float(gt_volume) + EPS)
-    )
-
-    dice_loss = 1.0 - dice
-
-    return {
-        "dice": float(dice),
-        "dice_loss": float(dice_loss),
-        "iou": float(iou),
-        "precision": float(precision),
-        "recall": float(recall),
-        "specificity": float(specificity),
-        "volume_similarity": float(volume_similarity),
-        "pred_pixels": int(pred_volume),
-        "gt_pixels": int(gt_volume),
-        "tp": int(tp),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tn": int(tn),
-    }
+    return int(len(result.boxes.cls))
 
 
-def get_surface(mask):
-    mask = mask.astype(bool)
+# -------------------------------------------------------
+# Evaluation on train / val split
+# -------------------------------------------------------
 
-    if not mask.any():
-        return mask
-
-    eroded = binary_erosion(mask, structure=np.ones((3, 3)), border_value=0)
-    surface = np.logical_xor(mask, eroded)
-
-    if not surface.any():
-        return mask
-
-    return surface
-
-
-def compute_surface_distances(pred, gt):
-    pred = pred.astype(bool)
-    gt = gt.astype(bool)
-
-    height, width = gt.shape
-    max_distance = float(np.sqrt(height ** 2 + width ** 2))
-
-    if not pred.any() and not gt.any():
-        return np.array([0.0], dtype=np.float32)
-
-    if pred.any() != gt.any():
-        return np.array([max_distance], dtype=np.float32)
-
-    pred_surface = get_surface(pred)
-    gt_surface = get_surface(gt)
-
-    dt_gt = distance_transform_edt(np.logical_not(gt_surface))
-    dt_pred = distance_transform_edt(np.logical_not(pred_surface))
-
-    pred_to_gt = dt_gt[pred_surface]
-    gt_to_pred = dt_pred[gt_surface]
-
-    distances = np.concatenate([pred_to_gt, gt_to_pred]).astype(np.float32)
-
-    if distances.size == 0:
-        return np.array([0.0], dtype=np.float32)
-
-    return distances
-
-
-def compute_boundary_metrics(pred, gt):
-    distances = compute_surface_distances(pred, gt)
-
-    hd = float(np.max(distances))
-    hd95 = float(np.percentile(distances, 95))
-    asd = float(np.mean(distances))
-
-    return {
-        "hd": hd,
-        "hd95": hd95,
-        "asd": asd,
-    }
-
-
-def compute_all_metrics(pred, gt):
-    overlap = compute_overlap_metrics(pred, gt)
-    boundary = compute_boundary_metrics(pred, gt)
-
-    metrics = {}
-    metrics.update(overlap)
-    metrics.update(boundary)
-
-    return metrics
-
-
-# -----------------------------
-# Epoch evaluation
-# -----------------------------
-
-def evaluate_weight_on_val(
+def evaluate_model_on_split(
+    model: YOLO,
     weight_path: Path,
-    val_df: pd.DataFrame,
+    data_df: pd.DataFrame,
+    split_name: str,
     epoch: int,
     imgsz: int,
     conf: float,
@@ -264,14 +350,27 @@ def evaluate_weight_on_val(
     save_per_sample: bool = False,
     per_sample_dir: Path | None = None,
 ):
-    model = YOLO(str(weight_path))
+    """
+    Evaluates one YOLO checkpoint on one split.
+
+    split_name:
+    - train
+    - val
+    - test
+
+    Returns:
+    - summary dictionary with prefixed metrics.
+    """
 
     if eval_img_limit and eval_img_limit > 0:
-        eval_df = val_df.head(eval_img_limit).copy()
+        eval_df = data_df.head(eval_img_limit).copy()
     else:
-        eval_df = val_df.copy()
+        eval_df = data_df.copy()
 
-    image_paths = [str(get_eval_image_path(row)) for _, row in eval_df.iterrows()]
+    image_paths = [
+        str(get_eval_image_path(row))
+        for _, row in eval_df.iterrows()
+    ]
 
     results_generator = model.predict(
         source=image_paths,
@@ -289,12 +388,13 @@ def evaluate_weight_on_val(
     for (_, row), result in tqdm(
         zip(eval_df.iterrows(), results_generator),
         total=len(eval_df),
-        desc=f"Evaluating epoch {epoch}",
+        desc=f"Evaluating {split_name} epoch {epoch}",
         leave=False,
     ):
-        mask_path = Path(str(row["mask_path"]))
-        gt_mask = read_mask_binary(mask_path, threshold=mask_threshold)
+        image_path = get_eval_image_path(row)
+        mask_path = get_mask_path(row)
 
+        gt_mask = read_mask_binary(mask_path, threshold=mask_threshold)
         pred_mask = result_to_binary_mask(result, target_shape=gt_mask.shape)
 
         if pred_mask.shape != gt_mask.shape:
@@ -304,21 +404,32 @@ def evaluate_weight_on_val(
                 interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
 
-        metrics = compute_all_metrics(pred_mask, gt_mask)
+        metrics = compute_binary_segmentation_metrics(
+            pred=pred_mask,
+            gt=gt_mask,
+            pred_threshold=None,
+            gt_threshold=None,
+            spacing=None,
+        )
 
-        gt_class = int(row["class_id"])
+        gt_class = int(row["class_id"]) if "class_id" in row and pd.notna(row["class_id"]) else -1
         pred_class = get_top_predicted_class(result)
+
         class_correct = int(pred_class == gt_class)
+        num_predictions = get_num_predictions(result)
 
         sample_result = {
             "epoch": epoch,
-            "image_filename": Path(str(row["image_path"])).name,
-            "mask_filename": Path(str(row["mask_path"])).name,
+            "split": split_name,
+            "weight_path": str(weight_path),
+            "image_filename": image_path.name,
+            "mask_filename": mask_path.name,
             "tumour_label": row.get("tumour_label", "unknown"),
             "plane_label": row.get("plane_label", "unknown"),
             "gt_class_id": gt_class,
             "top_pred_class_id": pred_class,
             "class_correct": class_correct,
+            "num_predictions": num_predictions,
             **metrics,
         }
 
@@ -327,53 +438,113 @@ def evaluate_weight_on_val(
     sample_df = pd.DataFrame(sample_rows)
 
     if save_per_sample and per_sample_dir is not None:
-        per_sample_dir.mkdir(parents=True, exist_ok=True)
-        sample_df.to_csv(per_sample_dir / f"val_sample_metrics_epoch_{epoch:03d}.csv", index=False)
-
-    metric_cols = [
-        "dice",
-        "dice_loss",
-        "iou",
-        "precision",
-        "recall",
-        "specificity",
-        "volume_similarity",
-        "hd",
-        "hd95",
-        "asd",
-        "pred_pixels",
-        "gt_pixels",
-        "tp",
-        "fp",
-        "fn",
-        "tn",
-    ]
+        split_dir = per_sample_dir / split_name
+        split_dir.mkdir(parents=True, exist_ok=True)
+        sample_df.to_csv(
+            split_dir / f"{split_name}_sample_metrics_epoch_{epoch:03d}.csv",
+            index=False,
+        )
 
     summary = {
-        "epoch": epoch,
-        "weight_path": str(weight_path),
-        "num_val_images": int(len(sample_df)),
+        f"{split_name}_num_images": int(len(sample_df)),
     }
 
-    for col in metric_cols:
-        summary[f"val_{col}"] = float(sample_df[col].mean())
+    for col in STANDARD_BINARY_METRIC_COLUMNS:
+        if col in sample_df.columns:
+            summary[f"{split_name}_{col}"] = float(sample_df[col].mean())
 
-    summary["val_class_accuracy"] = float(sample_df["class_correct"].mean())
+    summary[f"{split_name}_class_accuracy"] = float(sample_df["class_correct"].mean())
+    summary[f"{split_name}_avg_num_predictions"] = float(sample_df["num_predictions"].mean())
 
-    del model
-    gc.collect()
+    # Class-wise metrics for tumour-type-aware segmentation
+    for tumour_label, group in sample_df.groupby("tumour_label"):
+        clean_label = str(tumour_label).strip().lower().replace(" ", "_")
+
+        summary[f"{split_name}_{clean_label}_dice"] = float(group["dice"].mean())
+        summary[f"{split_name}_{clean_label}_iou"] = float(group["iou"].mean())
+        summary[f"{split_name}_{clean_label}_hd95"] = float(group["hd95"].mean())
+        summary[f"{split_name}_{clean_label}_asd"] = float(group["asd"].mean())
 
     return summary
 
 
-# -----------------------------
-# Training
-# -----------------------------
+def evaluate_one_weight_on_train_and_val(
+    weight_path: Path,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    imgsz: int,
+    conf: float,
+    iou: float,
+    device: str,
+    eval_batch: int,
+    mask_threshold: int,
+    train_eval_limit: int,
+    val_eval_limit: int,
+    save_per_sample: bool,
+    per_sample_dir: Path,
+    evaluate_train: bool = True,
+):
+    weight_name, epoch = get_weight_name_and_epoch(weight_path)
+
+    model = YOLO(str(weight_path))
+
+    row = {
+        "epoch": epoch,
+        "weight_name": weight_name,
+        "weight_path": str(weight_path),
+    }
+
+    if evaluate_train:
+        train_summary = evaluate_model_on_split(
+            model=model,
+            weight_path=weight_path,
+            data_df=train_df,
+            split_name="train",
+            epoch=epoch,
+            imgsz=imgsz,
+            conf=conf,
+            iou=iou,
+            device=device,
+            eval_batch=eval_batch,
+            mask_threshold=mask_threshold,
+            eval_img_limit=train_eval_limit,
+            save_per_sample=save_per_sample,
+            per_sample_dir=per_sample_dir,
+        )
+        row.update(train_summary)
+
+    val_summary = evaluate_model_on_split(
+        model=model,
+        weight_path=weight_path,
+        data_df=val_df,
+        split_name="val",
+        epoch=epoch,
+        imgsz=imgsz,
+        conf=conf,
+        iou=iou,
+        device=device,
+        eval_batch=eval_batch,
+        mask_threshold=mask_threshold,
+        eval_img_limit=val_eval_limit,
+        save_per_sample=save_per_sample,
+        per_sample_dir=per_sample_dir,
+    )
+    row.update(val_summary)
+
+    del model
+    gc.collect()
+
+    return row
+
+
+# -------------------------------------------------------
+# YOLO training
+# -------------------------------------------------------
 
 def train_yolo(args):
     model = YOLO(args.model)
 
-    model.train(
+    results = model.train(
         data=args.data,
         epochs=args.epochs,
         imgsz=args.imgsz,
@@ -391,6 +562,20 @@ def train_yolo(args):
         verbose=True,
     )
 
+    save_dir = None
+
+    if hasattr(model, "trainer") and hasattr(model.trainer, "save_dir"):
+        save_dir = Path(model.trainer.save_dir)
+
+    elif hasattr(results, "save_dir"):
+        save_dir = Path(results.save_dir)
+
+    return save_dir
+
+
+# -------------------------------------------------------
+# CSV merge
+# -------------------------------------------------------
 
 def merge_with_ultralytics_results(run_dir: Path, custom_metrics_path: Path):
     ultralytics_results_path = run_dir / "results.csv"
@@ -419,7 +604,7 @@ def merge_with_ultralytics_results(run_dir: Path, custom_metrics_path: Path):
         left_on="epoch_for_merge",
         right_on="epoch",
         how="left",
-        suffixes=("_ultralytics", "_custom"),
+        suffixes=("_ultralytics", "_medical"),
     )
 
     merged_path = run_dir / "research_metrics_merged.csv"
@@ -428,13 +613,16 @@ def merge_with_ultralytics_results(run_dir: Path, custom_metrics_path: Path):
     return merged_path
 
 
-# -----------------------------
+# -------------------------------------------------------
 # Main
-# -----------------------------
+# -------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train YOLOv26 segmentation on BRISC and compute research metrics per epoch."
+        description=(
+            "Train YOLOv26 segmentation on BRISC and compute train/val "
+            "medical segmentation metrics per epoch."
+        )
     )
 
     parser.add_argument(
@@ -452,10 +640,17 @@ def main():
     )
 
     parser.add_argument(
+        "--train-csv",
+        type=str,
+        required=True,
+        help="Path to training split CSV, e.g. data/splits/brisc_yolo_train.csv",
+    )
+
+    parser.add_argument(
         "--val-csv",
         type=str,
         required=True,
-        help="Path to validation split CSV created during YOLO dataset preparation.",
+        help="Path to validation split CSV, e.g. data/splits/brisc_yolo_val.csv",
     )
 
     parser.add_argument(
@@ -483,14 +678,14 @@ def main():
         "--conf",
         type=float,
         default=0.25,
-        help="Confidence threshold for validation prediction metrics.",
+        help="Confidence threshold for prediction-based medical metrics.",
     )
 
     parser.add_argument(
         "--iou",
         type=float,
         default=0.7,
-        help="NMS IoU threshold for validation prediction metrics.",
+        help="NMS IoU threshold for prediction-based medical metrics.",
     )
 
     parser.add_argument(
@@ -508,113 +703,167 @@ def main():
     )
 
     parser.add_argument(
-        "--eval-img-limit",
+        "--train-eval-limit",
         type=int,
         default=0,
-        help="Use 0 for full validation set. Use small number like 50 for debugging.",
+        help=(
+            "Number of train images used for medical metric evaluation. "
+            "Use 0 for full train set."
+        ),
     )
 
     parser.add_argument(
-        "--skip-train",
+        "--val-eval-limit",
+        type=int,
+        default=0,
+        help=(
+            "Number of validation images used for medical metric evaluation. "
+            "Use 0 for full validation set."
+        ),
+    )
+
+    parser.add_argument(
+        "--skip-yolo-train",
         action="store_true",
-        help="Skip training and only evaluate saved epoch weights.",
+        help="Skip YOLO training and only evaluate existing saved weights.",
+    )
+
+    parser.add_argument(
+        "--skip-train-metrics",
+        action="store_true",
+        help="Only calculate validation metrics, not train metrics.",
     )
 
     parser.add_argument(
         "--save-per-sample",
         action="store_true",
-        help="Save per-image metrics for every epoch. This creates many CSV rows.",
+        help="Save per-image train/val metric CSVs for every epoch.",
     )
 
     parser.add_argument(
         "--delete-epoch-weights-after-eval",
         action="store_true",
-        help="Delete epoch*.pt files after custom metrics are computed. Keeps last.pt and best.pt.",
+        help="Delete epoch*.pt files after medical metrics are computed. Keeps best.pt and last.pt.",
+    )
+
+    parser.add_argument(
+        "--eval-weight-mode",
+        type=str,
+        default="epochs",
+        choices=["epochs", "best", "last", "best-last", "all"],
+        help=(
+            "Which weights to evaluate. Use 'epochs' for per-epoch curves. "
+            "Use 'best-last' for quick final comparison."
+        ),
     )
 
     args = parser.parse_args()
 
-    run_dir = Path(args.project) / args.name
+    expected_run_dir = Path(args.project) / args.name
+
+    train_csv = Path(args.train_csv)
     val_csv = Path(args.val_csv)
+
+    if not train_csv.exists():
+        raise FileNotFoundError(f"Training CSV not found: {train_csv}")
 
     if not val_csv.exists():
         raise FileNotFoundError(f"Validation CSV not found: {val_csv}")
 
+    train_df = pd.read_csv(train_csv)
     val_df = pd.read_csv(val_csv)
 
-    required_cols = ["image_path", "mask_path", "class_id"]
-
-    for col in required_cols:
-        if col not in val_df.columns:
-            raise ValueError(f"Validation CSV missing required column: {col}")
+    validate_split_csv(train_df, train_csv)
+    validate_split_csv(val_df, val_csv)
 
     print("=" * 80)
     print("YOLOv26 BRISC RESEARCH TRAINING")
     print("=" * 80)
     print(f"Model: {args.model}")
     print(f"Data YAML: {args.data}")
-    print(f"Validation CSV: {val_csv}")
-    print(f"Run directory: {run_dir}")
+    print(f"Train CSV: {train_csv}")
+    print(f"Val CSV: {val_csv}")
+    print(f"Expected run directory: {expected_run_dir}")
     print(f"Epochs: {args.epochs}")
     print(f"Image size: {args.imgsz}")
     print(f"Batch size: {args.batch}")
     print(f"Device: {args.device}")
+    print(f"Optimizer: {args.optimizer}")
+    print(f"Evaluate train metrics: {not args.skip_train_metrics}")
+    print(f"Train eval limit: {args.train_eval_limit}")
+    print(f"Val eval limit: {args.val_eval_limit}")
+    print(f"Eval weight mode: {args.eval_weight_mode}")
     print("=" * 80)
 
-    if not args.skip_train:
-        train_yolo(args)
+    if not args.skip_yolo_train:
+        save_dir = train_yolo(args)
+
+        if save_dir is not None and save_dir.exists():
+            run_dir = save_dir
+        else:
+            run_dir = find_actual_run_dir(args.project, args.name)
+
     else:
-        print("[INFO] Skipping training. Evaluating existing epoch weights only.")
+        print("[INFO] Skipping YOLO training. Evaluating existing weights only.")
+        run_dir = find_actual_run_dir(args.project, args.name)
 
-    if not run_dir.exists():
-        raise FileNotFoundError(f"Run directory not found after training: {run_dir}")
+    print(f"[INFO] Actual YOLO run directory detected: {run_dir}")
 
-    epoch_weights = find_epoch_weights(run_dir)
-
-    if len(epoch_weights) == 0:
-        raise RuntimeError(
-            "No epoch*.pt weights found. Make sure training used save_period=1."
-        )
+    weights = collect_weights(run_dir, mode=args.eval_weight_mode)
 
     print("\n" + "=" * 80)
-    print("CUSTOM VALIDATION METRICS PER EPOCH")
+    print("CUSTOM TRAIN + VALIDATION MEDICAL METRICS")
     print("=" * 80)
-    print(f"Epoch weights found: {len(epoch_weights)}")
+    print(f"Weights selected: {[w.name for w in weights]}")
+    print("=" * 80)
 
     custom_rows = []
-    per_sample_dir = run_dir / "per_sample_val_metrics"
+    per_sample_dir = run_dir / "per_sample_train_val_metrics"
 
-    for weight_path in epoch_weights:
-        epoch = extract_epoch_number(weight_path)
+    for weight_path in weights:
+        weight_name, epoch = get_weight_name_and_epoch(weight_path)
 
-        summary = evaluate_weight_on_val(
+        summary = evaluate_one_weight_on_train_and_val(
             weight_path=weight_path,
+            train_df=train_df,
             val_df=val_df,
-            epoch=epoch,
             imgsz=args.imgsz,
             conf=args.conf,
             iou=args.iou,
             device=args.device,
             eval_batch=args.eval_batch,
             mask_threshold=args.mask_threshold,
-            eval_img_limit=args.eval_img_limit,
+            train_eval_limit=args.train_eval_limit,
+            val_eval_limit=args.val_eval_limit,
             save_per_sample=args.save_per_sample,
             per_sample_dir=per_sample_dir,
+            evaluate_train=not args.skip_train_metrics,
         )
 
         custom_rows.append(summary)
 
+        train_text = ""
+        if not args.skip_train_metrics:
+            train_text = (
+                f"Train Dice: {summary['train_dice']:.4f} | "
+                f"Train IoU: {summary['train_iou']:.4f} | "
+                f"Train HD95: {summary['train_hd95']:.4f} | "
+            )
+
         print(
             f"Epoch {epoch:03d} | "
-            f"Dice: {summary['val_dice']:.4f} | "
-            f"Dice Loss: {summary['val_dice_loss']:.4f} | "
-            f"IoU: {summary['val_iou']:.4f} | "
-            f"HD95: {summary['val_hd95']:.4f} | "
-            f"ASD: {summary['val_asd']:.4f} | "
-            f"Class Acc: {summary['val_class_accuracy']:.4f}"
+            f"{train_text}"
+            f"Val Dice: {summary['val_dice']:.4f} | "
+            f"Val Dice Loss: {summary['val_dice_loss']:.4f} | "
+            f"Val IoU: {summary['val_iou']:.4f} | "
+            f"Val Precision: {summary['val_precision']:.4f} | "
+            f"Val Recall: {summary['val_recall']:.4f} | "
+            f"Val HD95: {summary['val_hd95']:.4f} | "
+            f"Val ASD: {summary['val_asd']:.4f} | "
+            f"Val Class Acc: {summary['val_class_accuracy']:.4f}"
         )
 
-        if args.delete_epoch_weights_after_eval:
+        if args.delete_epoch_weights_after_eval and weight_path.name.startswith("epoch"):
             try:
                 os.remove(weight_path)
             except OSError:
@@ -622,7 +871,7 @@ def main():
 
     custom_df = pd.DataFrame(custom_rows).sort_values("epoch")
 
-    custom_metrics_path = run_dir / "custom_val_metrics_by_epoch.csv"
+    custom_metrics_path = run_dir / "custom_train_val_metrics_by_epoch.csv"
     custom_df.to_csv(custom_metrics_path, index=False)
 
     merged_path = merge_with_ultralytics_results(
@@ -633,21 +882,38 @@ def main():
     print("\n" + "=" * 80)
     print("RESEARCH METRICS COMPLETE")
     print("=" * 80)
-    print(f"Custom metrics saved to: {custom_metrics_path}")
+    print(f"Custom train/val medical metrics saved to: {custom_metrics_path}")
 
     if merged_path is not None:
-        print(f"Merged training + custom metrics saved to: {merged_path}")
+        print(f"Merged YOLO + medical metrics saved to: {merged_path}")
 
     best_row = custom_df.loc[custom_df["val_dice"].idxmax()]
 
     print("\nBest epoch by validation Dice:")
+    print(f"Weight: {best_row['weight_name']}")
     print(f"Epoch: {int(best_row['epoch'])}")
-    print(f"Dice: {best_row['val_dice']:.4f}")
-    print(f"Dice Loss: {best_row['val_dice_loss']:.4f}")
-    print(f"IoU: {best_row['val_iou']:.4f}")
-    print(f"HD95: {best_row['val_hd95']:.4f}")
-    print(f"ASD: {best_row['val_asd']:.4f}")
-    print(f"Class Accuracy: {best_row['val_class_accuracy']:.4f}")
+    print(f"Val Dice: {best_row['val_dice']:.4f}")
+    print(f"Val Dice Loss: {best_row['val_dice_loss']:.4f}")
+    print(f"Val IoU: {best_row['val_iou']:.4f}")
+    print(f"Val Precision: {best_row['val_precision']:.4f}")
+    print(f"Val Recall: {best_row['val_recall']:.4f}")
+    print(f"Val Specificity: {best_row['val_specificity']:.4f}")
+    print(f"Val HD95: {best_row['val_hd95']:.4f}")
+    print(f"Val ASD: {best_row['val_asd']:.4f}")
+    print(f"Val Volume Similarity: {best_row['val_volume_similarity']:.4f}")
+    print(f"Val Class Accuracy: {best_row['val_class_accuracy']:.4f}")
+
+    if not args.skip_train_metrics:
+        print("\nSame epoch training metrics:")
+        print(f"Train Dice: {best_row['train_dice']:.4f}")
+        print(f"Train Dice Loss: {best_row['train_dice_loss']:.4f}")
+        print(f"Train IoU: {best_row['train_iou']:.4f}")
+        print(f"Train Precision: {best_row['train_precision']:.4f}")
+        print(f"Train Recall: {best_row['train_recall']:.4f}")
+        print(f"Train Specificity: {best_row['train_specificity']:.4f}")
+        print(f"Train HD95: {best_row['train_hd95']:.4f}")
+        print(f"Train ASD: {best_row['train_asd']:.4f}")
+        print(f"Train Volume Similarity: {best_row['train_volume_similarity']:.4f}")
 
 
 if __name__ == "__main__":

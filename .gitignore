@@ -37,6 +37,7 @@ venv/
 # Allow final results structure
 results/predictions/
 results/checkpoints/
-
+results/New-BraTS-2020-YOLOv26-128-N-1.rar
+results/New-BraTS-2020-YOLOv26-128-N-1/
 *summary.txt
 summary.txt
