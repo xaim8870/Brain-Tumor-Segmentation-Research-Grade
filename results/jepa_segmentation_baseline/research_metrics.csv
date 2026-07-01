@@ -1,0 +1,3 @@
+epoch,train_loss,train_bce_loss,train_dice_loss,train_dice,train_iou,train_precision,train_recall,train_hd95,train_asd,val_loss,val_bce_loss,val_dice_loss,val_dice,val_iou,val_precision,val_recall,val_hd95,val_asd
+1,0.6310809269618534,0.26216185358019817,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.5449456443780563,0.08989128897385494,1.0,0.0,0.0,0.0,0.0,0.0,0.0
+2,0.5229344053753608,0.04586881089760124,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.510240006477133,0.020480014999152137,1.0,0.0,0.0,0.0,0.0,0.0,0.0

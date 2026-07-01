@@ -333,7 +333,45 @@ def get_num_predictions(result):
 # -------------------------------------------------------
 # Evaluation on train / val split
 # -------------------------------------------------------
+def postprocess_pred_mask(
+    pred_mask,
+    min_component_area=30,
+    keep_largest=True,
+    fill_holes=True,
+):
+    mask = pred_mask.astype(np.uint8)
 
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    if num_labels <= 1:
+        return mask.astype(bool)
+
+    components = []
+
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area >= min_component_area:
+            components.append((label_id, area))
+
+    if not components:
+        return np.zeros_like(mask).astype(bool)
+
+    clean = np.zeros_like(mask)
+
+    if keep_largest:
+        largest_id = max(components, key=lambda x: x[1])[0]
+        clean[labels == largest_id] = 1
+    else:
+        for label_id, _ in components:
+            clean[labels == label_id] = 1
+
+    if fill_holes:
+        contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        filled = np.zeros_like(clean)
+        cv2.drawContours(filled, contours, -1, 1, thickness=cv2.FILLED)
+        clean = filled
+
+    return clean.astype(bool)
 def evaluate_model_on_split(
     model: YOLO,
     weight_path: Path,
@@ -396,6 +434,12 @@ def evaluate_model_on_split(
 
         gt_mask = read_mask_binary(mask_path, threshold=mask_threshold)
         pred_mask = result_to_binary_mask(result, target_shape=gt_mask.shape)
+        pred_mask = postprocess_pred_mask(
+            pred_mask,
+            min_component_area=30,
+            keep_largest=True,
+            fill_holes=True,
+        )
 
         if pred_mask.shape != gt_mask.shape:
             pred_mask = cv2.resize(
@@ -543,25 +587,102 @@ def evaluate_one_weight_on_train_and_val(
 
 def train_yolo(args):
     model = YOLO(args.model)
+    def callback_function(trainer):
+        epoch = int(trainer.epoch) + 1
 
+        try:
+            run_dir = Path(trainer.save_dir)
+            weight_path = run_dir / "weights" / "last.pt"
+
+            if not weight_path.exists():
+                print(f"[WARN] Epoch {epoch}: last.pt not found yet.")
+                return
+
+            print(f"\n[INFO] Live medical validation metrics for epoch {epoch}")
+
+            live_model = YOLO(str(weight_path))
+
+            val_df = pd.read_csv(args.val_csv)
+
+            summary = evaluate_model_on_split(
+                model=live_model,
+                weight_path=weight_path,
+                data_df=val_df,
+                split_name="val",
+                epoch=epoch,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                iou=args.iou,
+                device=args.device,
+                eval_batch=1,
+                mask_threshold=args.mask_threshold,
+                eval_img_limit=args.val_eval_limit,
+                save_per_sample=False,
+                per_sample_dir=None,
+            )
+
+            row = {
+                "epoch": epoch,
+                "weight_name": "last",
+                "weight_path": str(weight_path),
+                **summary,
+            }
+
+            csv_path = run_dir / "custom_val_metrics_live_by_epoch.csv"
+            row_df = pd.DataFrame([row])
+
+            if csv_path.exists():
+                row_df.to_csv(csv_path, mode="a", header=False, index=False)
+            else:
+                row_df.to_csv(csv_path, index=False)
+
+            print(
+                f"[LIVE] Epoch {epoch:03d} | "
+                f"Val Dice: {summary['val_dice']:.4f} | "
+                f"Val IoU: {summary['val_iou']:.4f} | "
+                f"Val HD95: {summary['val_hd95']:.4f} | "
+                f"Val ASD: {summary['val_asd']:.4f}"
+            )
+
+            del live_model
+
+        except Exception as e:
+            print(f"[ERROR] Live medical metrics failed at epoch {epoch}: {e}")
+
+        finally:
+            gc.collect()
+    model.add_callback("on_train_epoch_end", callback_function)
     results = model.train(
-        data=args.data,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=args.device,
-        project=args.project,
-        name=args.name,
-        exist_ok=True,
-        save=True,
-        save_period=1,
-        patience=0,
-        workers=args.workers,
-        optimizer=args.optimizer,
-        plots=True,
-        verbose=True,
-    )
+    data=args.data,
+    epochs=args.epochs,
+    imgsz=args.imgsz,
+    batch=args.batch,
+    device=args.device,
+    project=args.project,
+    name=args.name,
+    exist_ok=True,
+    save=True,
+    save_period=1,
+    patience=25,
+    workers=args.workers,
+    optimizer=args.optimizer,
+    plots=True,
+    verbose=True,
 
+    degrees=5,
+    translate=0.03,
+    scale=0.20,
+    shear=0.0,
+    perspective=0.0,
+    fliplr=0.5,
+    flipud=0.0,
+    mosaic=0.0,
+    mixup=0.0,
+    copy_paste=0.0,
+    hsv_h=0.0,
+    hsv_s=0.0,
+    hsv_v=0.05,
+)
     save_dir = None
 
     if hasattr(model, "trainer") and hasattr(model.trainer, "save_dir"):

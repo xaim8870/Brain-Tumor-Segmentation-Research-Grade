@@ -1,7 +1,0 @@
-split,plane_label,count
-test,axial,346
-test,coronal,257
-test,sagittal,257
-train,axial,1243
-train,coronal,1366
-train,sagittal,1324

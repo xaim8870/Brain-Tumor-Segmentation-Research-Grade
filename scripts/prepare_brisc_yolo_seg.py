@@ -1,3 +1,4 @@
+# scripts/prepare_brisc_yolo_seg.py
 from pathlib import Path
 import argparse
 import random
